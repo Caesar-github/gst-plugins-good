@@ -39,6 +39,8 @@
 #include "config.h"
 #endif
 
+#include <stdlib.h>
+
 #include "gstautovideosink.h"
 
 #define DEFAULT_TS_OFFSET           0
@@ -95,6 +97,7 @@ gst_auto_video_sink_init (GstAutoVideoSink * sink)
 
   autodetect->media_klass = "Video";
   autodetect->flag = GST_ELEMENT_FLAG_SINK;
+  autodetect->preferred = getenv("AUTOVIDEOSINK_PREFERRED");
 
   sink->ts_offset = DEFAULT_TS_OFFSET;
 }
