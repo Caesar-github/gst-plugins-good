@@ -103,8 +103,11 @@ rtp_jitter_buffer_finalize (GObject * object)
   if (jbuf->media_clock_synced_id)
     g_signal_handler_disconnect (jbuf->media_clock,
         jbuf->media_clock_synced_id);
-  if (jbuf->media_clock)
+  if (jbuf->media_clock) {
+    /* Make sure to clear any clock master before releasing the clock */
+    gst_clock_set_master (jbuf->media_clock, NULL);
     gst_object_unref (jbuf->media_clock);
+  }
 
   if (jbuf->pipeline_clock)
     gst_object_unref (jbuf->pipeline_clock);
@@ -527,7 +530,7 @@ update_buffer_level (RTPJitterBuffer * jbuf, gint * percent)
  */
 static GstClockTime
 calculate_skew (RTPJitterBuffer * jbuf, guint64 ext_rtptime,
-    GstClockTime gstrtptime, GstClockTime time)
+    GstClockTime gstrtptime, GstClockTime time, gint gap, gboolean is_rtx)
 {
   guint64 send_diff, recv_diff;
   gint64 delta;
@@ -541,7 +544,7 @@ calculate_skew (RTPJitterBuffer * jbuf, guint64 ext_rtptime,
 
   /* we don't have an arrival timestamp so we can't do skew detection. we
    * should still apply a timestamp based on RTP timestamp and base_time */
-  if (time == -1 || jbuf->base_time == -1)
+  if (time == -1 || jbuf->base_time == -1 || is_rtx)
     goto no_skew;
 
   /* elapsed time at receiver, includes the jitter */
@@ -571,7 +574,13 @@ calculate_skew (RTPJitterBuffer * jbuf, guint64 ext_rtptime,
     rtp_jitter_buffer_resync (jbuf, time, gstrtptime, ext_rtptime, TRUE);
     send_diff = 0;
     delta = 0;
+    gap = 0;
   }
+
+  /* only do skew calculations if we didn't have a gap. if too much time
+   * has elapsed despite there being a gap, we resynced already. */
+  if (G_UNLIKELY (gap != 0))
+    goto no_skew;
 
   pos = jbuf->window_pos;
 
@@ -690,7 +699,8 @@ queue_do_insert (RTPJitterBuffer * jbuf, GList * list, GList * item)
 
 GstClockTime
 rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
-    gboolean estimated_dts, guint32 rtptime, GstClockTime base_time)
+    gboolean estimated_dts, guint32 rtptime, GstClockTime base_time,
+    gint gap, gboolean is_rtx)
 {
   guint64 ext_rtptime;
   GstClockTime gstrtptime, pts;
@@ -711,10 +721,18 @@ rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
     ext_rtptime = gst_rtp_buffer_ext_timestamp (&ext_rtptime, rtptime);
     if (ext_rtptime > jbuf->last_rtptime + 3 * jbuf->clock_rate ||
         ext_rtptime + 3 * jbuf->clock_rate < jbuf->last_rtptime) {
-      /* reset even if we don't have valid incoming time;
-       * still better than producing possibly very bogus output timestamp */
-      GST_WARNING ("rtp delta too big, reset skew");
-      rtp_jitter_buffer_reset_skew (jbuf);
+      if (!is_rtx) {
+        /* reset even if we don't have valid incoming time;
+         * still better than producing possibly very bogus output timestamp */
+        GST_WARNING ("rtp delta too big, reset skew");
+        rtp_jitter_buffer_reset_skew (jbuf);
+      } else {
+        GST_WARNING ("rtp delta too big: ignore rtx packet");
+        media_clock = NULL;
+        pipeline_clock = NULL;
+        pts = GST_CLOCK_TIME_NONE;
+        goto done;
+      }
     }
   }
 
@@ -740,11 +758,17 @@ rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
   if (G_LIKELY (jbuf->base_rtptime != -1)) {
     /* check elapsed time in RTP units */
     if (gstrtptime < jbuf->base_rtptime) {
-      /* elapsed time at sender, timestamps can go backwards and thus be
-       * smaller than our base time, schedule to take a new base time in
-       * that case. */
-      GST_WARNING ("backward timestamps at server, schedule resync");
-      jbuf->need_resync = TRUE;
+      if (!is_rtx) {
+        /* elapsed time at sender, timestamps can go backwards and thus be
+         * smaller than our base time, schedule to take a new base time in
+         * that case. */
+        GST_WARNING ("backward timestamps at server, schedule resync");
+        jbuf->need_resync = TRUE;
+      } else {
+        GST_WARNING ("backward timestamps: ignore rtx packet");
+        pts = GST_CLOCK_TIME_NONE;
+        goto done;
+      }
     }
   }
 
@@ -774,6 +798,11 @@ rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
   /* need resync, lock on to time and gstrtptime if we can, otherwise we
    * do with the previous values */
   if (G_UNLIKELY (jbuf->need_resync && dts != -1)) {
+    if (is_rtx) {
+      GST_DEBUG ("not resyncing on rtx packet, discard");
+      pts = GST_CLOCK_TIME_NONE;
+      goto done;
+    }
     GST_INFO ("resync to time %" GST_TIME_FORMAT ", rtptime %"
         GST_TIME_FORMAT, GST_TIME_ARGS (dts), GST_TIME_ARGS (gstrtptime));
     rtp_jitter_buffer_resync (jbuf, dts, gstrtptime, ext_rtptime, FALSE);
@@ -896,7 +925,7 @@ rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
 
     /* do skew calculation by measuring the difference between rtptime and the
      * receive dts, this function will return the skew corrected rtptime. */
-    pts = calculate_skew (jbuf, ext_rtptime, gstrtptime, dts);
+    pts = calculate_skew (jbuf, ext_rtptime, gstrtptime, dts, gap, is_rtx);
   }
 
   /* check if timestamps are not going backwards, we can only check this if we
@@ -918,20 +947,22 @@ rtp_jitter_buffer_calculate_pts (RTPJitterBuffer * jbuf, GstClockTime dts,
     }
   }
 
-  if (dts != -1 && pts + jbuf->delay < dts) {
+  if (gap == 0 && dts != -1 && pts + jbuf->delay < dts) {
     /* if we are going to produce a timestamp that is later than the input
      * timestamp, we need to reset the jitterbuffer. Likely the server paused
      * temporarily */
     GST_DEBUG ("out %" GST_TIME_FORMAT " + %" G_GUINT64_FORMAT " < time %"
-        GST_TIME_FORMAT ", reset jitterbuffer", GST_TIME_ARGS (pts),
+        GST_TIME_FORMAT ", reset jitterbuffer and discard", GST_TIME_ARGS (pts),
         jbuf->delay, GST_TIME_ARGS (dts));
-    rtp_jitter_buffer_resync (jbuf, dts, gstrtptime, ext_rtptime, TRUE);
-    pts = dts;
+    rtp_jitter_buffer_reset_skew (jbuf);
+    pts = GST_CLOCK_TIME_NONE;
+    goto done;
   }
 
   jbuf->prev_out_time = pts;
   jbuf->prev_send_diff = gstrtptime - jbuf->base_rtptime;
 
+done:
   if (media_clock)
     gst_object_unref (media_clock);
   if (pipeline_clock)
@@ -1046,7 +1077,7 @@ duplicate:
  * @percent: the buffering percent
  *
  * Pops the oldest buffer from the packet queue of @jbuf. The popped buffer will
- * have its timestamp adjusted with the incomming running_time and the detected
+ * have its timestamp adjusted with the incoming running_time and the detected
  * clock skew.
  *
  * Returns: a #GstBuffer or %NULL when there was no packet in the queue.
@@ -1227,6 +1258,49 @@ rtp_jitter_buffer_get_ts_diff (RTPJitterBuffer * jbuf)
   return result;
 }
 
+
+/*
+ * rtp_jitter_buffer_get_seqnum_diff:
+ * @jbuf: an #RTPJitterBuffer
+ *
+ * Get the difference between the seqnum of first and last packet in the
+ * jitterbuffer.
+ *
+ * Returns: The difference expressed in seqnum.
+ */
+static guint16
+rtp_jitter_buffer_get_seqnum_diff (RTPJitterBuffer * jbuf)
+{
+  guint32 high_seqnum, low_seqnum;
+  RTPJitterBufferItem *high_buf, *low_buf;
+  guint16 result;
+
+  g_return_val_if_fail (jbuf != NULL, 0);
+
+  high_buf = (RTPJitterBufferItem *) g_queue_peek_tail_link (jbuf->packets);
+  low_buf = (RTPJitterBufferItem *) g_queue_peek_head_link (jbuf->packets);
+
+  while (high_buf && high_buf->seqnum == -1)
+    high_buf = (RTPJitterBufferItem *) high_buf->prev;
+
+  while (low_buf && low_buf->seqnum == -1)
+    low_buf = (RTPJitterBufferItem *) low_buf->next;
+
+  if (!high_buf || !low_buf || high_buf == low_buf)
+    return 0;
+
+  high_seqnum = high_buf->seqnum;
+  low_seqnum = low_buf->seqnum;
+
+  /* it needs to work if ts wraps */
+  if (high_seqnum >= low_seqnum) {
+    result = (guint32) (high_seqnum - low_seqnum);
+  } else {
+    result = (guint32) (high_seqnum + G_MAXUINT16 + 1 - low_seqnum);
+  }
+  return result;
+}
+
 /**
  * rtp_jitter_buffer_get_sync:
  * @jbuf: an #RTPJitterBuffer
@@ -1294,4 +1368,11 @@ rtp_jitter_buffer_can_fast_start (RTPJitterBuffer * jbuf, gint num_packet)
   }
 
   return ret;
+}
+
+gboolean
+rtp_jitter_buffer_is_full (RTPJitterBuffer * jbuf)
+{
+  return rtp_jitter_buffer_get_seqnum_diff (jbuf) >= 32765 &&
+      rtp_jitter_buffer_num_packets (jbuf) > 10000;
 }

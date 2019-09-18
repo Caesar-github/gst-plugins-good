@@ -19,6 +19,7 @@
 
 /**
  * SECTION:element-rtpsession
+ * @title: rtpsession
  * @see_also: rtpjitterbuffer, rtpbin, rtpptdemux, rtpssrcdemux
  *
  * The RTP session manager models participants with unique SSRC in an RTP
@@ -27,26 +28,19 @@
  * functionality can be activated.
  *
  * The session manager currently implements RFC 3550 including:
- * <itemizedlist>
- *   <listitem>
- *     <para>RTP packet validation based on consecutive sequence numbers.</para>
- *   </listitem>
- *   <listitem>
- *     <para>Maintainance of the SSRC participant database.</para>
- *   </listitem>
- *   <listitem>
- *     <para>Keeping per participant statistics based on received RTCP packets.</para>
- *   </listitem>
- *   <listitem>
- *     <para>Scheduling of RR/SR RTCP packets.</para>
- *   </listitem>
- *   <listitem>
- *     <para>Support for multiple sender SSRC.</para>
- *   </listitem>
- * </itemizedlist>
+ *
+ *   * RTP packet validation based on consecutive sequence numbers.
+ *
+ *   * Maintainance of the SSRC participant database.
+ *
+ *   * Keeping per participant statistics based on received RTCP packets.
+ *
+ *   * Scheduling of RR/SR RTCP packets.
+ *
+ *   * Support for multiple sender SSRC.
  *
  * The rtpsession will not demux packets based on SSRC or payload type, nor will
- * it correct for packet reordering and jitter. Use #GstRtpsSrcDemux,
+ * it correct for packet reordering and jitter. Use #GstRtpSsrcDemux,
  * #GstRtpPtDemux and GstRtpJitterBuffer in addition to #GstRtpSession to
  * perform these tasks. It is usually a good idea to use #GstRtpBin, which
  * combines all these features in one element.
@@ -75,8 +69,7 @@
  * mapping. One can clear the cached values with the #GstRtpSession::clear-pt-map
  * signal.
  *
- * <refsect2>
- * <title>Example pipelines</title>
+ * ## Example pipelines
  * |[
  * gst-launch-1.0 udpsrc port=5000 caps="application/x-rtp, ..." ! .recv_rtp_sink rtpsession .recv_rtp_src ! rtptheoradepay ! theoradec ! xvimagesink
  * ]| Receive theora RTP packets from port 5000 and send them to the depayloader,
@@ -105,7 +98,7 @@
  * correctly because the second udpsink will not preroll correctly (no RTCP
  * packets are sent in the PAUSED state). Applications should manually set and
  * keep (see gst_element_set_locked_state()) the RTCP udpsink to the PLAYING state.
- * </refsect2>
+ *
  */
 
 #ifdef HAVE_CONFIG_H
@@ -251,9 +244,6 @@ enum
   PROP_RTCP_SYNC_SEND_TIME
 };
 
-#define GST_RTP_SESSION_GET_PRIVATE(obj)  \
-	   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_RTP_SESSION, GstRtpSessionPrivate))
-
 #define GST_RTP_SESSION_LOCK(sess)   g_mutex_lock (&(sess)->priv->lock)
 #define GST_RTP_SESSION_UNLOCK(sess) g_mutex_unlock (&(sess)->priv->lock)
 
@@ -284,7 +274,14 @@ struct _GstRtpSessionPrivate
   GstRtpNtpTimeSource ntp_time_source;
   gboolean rtcp_sync_send_time;
 
-  guint rtx_count;
+  guint recv_rtx_req_count;
+  guint sent_rtx_req_count;
+
+  /*
+   * This is the list of processed packets in the receive path when upstream
+   * pushed a buffer list.
+   */
+  GstBufferList *processed_list;
 };
 
 /* callbacks to handle actions from the session manager */
@@ -308,6 +305,16 @@ static void gst_rtp_session_notify_nack (RTPSession * sess,
 static void gst_rtp_session_reconfigure (RTPSession * sess, gpointer user_data);
 static void gst_rtp_session_notify_early_rtcp (RTPSession * sess,
     gpointer user_data);
+static GstFlowReturn gst_rtp_session_chain_recv_rtp (GstPad * pad,
+    GstObject * parent, GstBuffer * buffer);
+static GstFlowReturn gst_rtp_session_chain_recv_rtp_list (GstPad * pad,
+    GstObject * parent, GstBufferList * list);
+static GstFlowReturn gst_rtp_session_chain_recv_rtcp (GstPad * pad,
+    GstObject * parent, GstBuffer * buffer);
+static GstFlowReturn gst_rtp_session_chain_send_rtp (GstPad * pad,
+    GstObject * parent, GstBuffer * buffer);
+static GstFlowReturn gst_rtp_session_chain_send_rtp_list (GstPad * pad,
+    GstObject * parent, GstBufferList * list);
 
 static RTPSessionCallbacks callbacks = {
   gst_rtp_session_process_rtp,
@@ -476,7 +483,7 @@ on_notify_stats (RTPSession * session, GParamSpec * spec,
 }
 
 #define gst_rtp_session_parent_class parent_class
-G_DEFINE_TYPE (GstRtpSession, gst_rtp_session, GST_TYPE_ELEMENT);
+G_DEFINE_TYPE_WITH_PRIVATE (GstRtpSession, gst_rtp_session, GST_TYPE_ELEMENT);
 
 static void
 gst_rtp_session_class_init (GstRtpSessionClass * klass)
@@ -486,8 +493,6 @@ gst_rtp_session_class_init (GstRtpSessionClass * klass)
 
   gobject_class = (GObjectClass *) klass;
   gstelement_class = (GstElementClass *) klass;
-
-  g_type_class_add_private (klass, sizeof (GstRtpSessionPrivate));
 
   gobject_class->finalize = gst_rtp_session_finalize;
   gobject_class->set_property = gst_rtp_session_set_property;
@@ -512,8 +517,9 @@ gst_rtp_session_class_init (GstRtpSessionClass * klass)
    */
   gst_rtp_session_signals[SIGNAL_CLEAR_PT_MAP] =
       g_signal_new ("clear-pt-map", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_ACTION, G_STRUCT_OFFSET (GstRtpSessionClass, clear_pt_map),
-      NULL, NULL, g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0, G_TYPE_NONE);
+      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+      G_STRUCT_OFFSET (GstRtpSessionClass, clear_pt_map),
+      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 0, G_TYPE_NONE);
 
   /**
    * GstRtpSession::on-new-ssrc:
@@ -732,13 +738,17 @@ gst_rtp_session_class_init (GstRtpSessionClass * klass)
    * Various session statistics. This property returns a GstStructure
    * with name application/x-rtp-session-stats with the following fields:
    *
-   *  "rtx-count"       G_TYPE_UINT   The number of retransmission events
-   *      received from downstream (in receiver mode)
-   *  "rtx-drop-count"  G_TYPE_UINT   The number of retransmission events
+   *  "recv-rtx-req-count  G_TYPE_UINT   The number of retransmission event
+   *      received from downstream (in receiver mode) (Since 1.16)
+   *  "sent-rtx-req-count" G_TYPE_UINT   The number of retransmission event
+   *      sent downstream (in sender mode) (Since 1.16)
+   *  "rtx-count"          G_TYPE_UINT   DEPRECATED Since 1.16, same as
+   *      "recv-rtx-req-count".
+   *  "rtx-drop-count"     G_TYPE_UINT   The number of retransmission events
    *      dropped (due to bandwidth constraints)
-   *  "sent-nack-count" G_TYPE_UINT   Number of NACKs sent
-   *  "recv-nack-count" G_TYPE_UINT   Number of NACKs received
-   *  "source-stats"    G_TYPE_BOXED  GValueArray of #RTPSource::stats for all
+   *  "sent-nack-count"    G_TYPE_UINT   Number of NACKs sent
+   *  "recv-nack-count"    G_TYPE_UINT   Number of NACKs received
+   *  "source-stats"       G_TYPE_BOXED  GValueArray of #RTPSource::stats for all
    *      RTP sources (Since 1.8)
    *
    * Since: 1.4
@@ -799,12 +809,19 @@ gst_rtp_session_class_init (GstRtpSessionClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (gst_rtp_session_debug,
       "rtpsession", 0, "RTP Session");
+
+  GST_DEBUG_REGISTER_FUNCPTR (gst_rtp_session_chain_recv_rtp);
+  GST_DEBUG_REGISTER_FUNCPTR (gst_rtp_session_chain_recv_rtp_list);
+  GST_DEBUG_REGISTER_FUNCPTR (gst_rtp_session_chain_recv_rtcp);
+  GST_DEBUG_REGISTER_FUNCPTR (gst_rtp_session_chain_send_rtp);
+  GST_DEBUG_REGISTER_FUNCPTR (gst_rtp_session_chain_send_rtp_list);
+
 }
 
 static void
 gst_rtp_session_init (GstRtpSession * rtpsession)
 {
-  rtpsession->priv = GST_RTP_SESSION_GET_PRIVATE (rtpsession);
+  rtpsession->priv = gst_rtp_session_get_instance_private (rtpsession);
   g_mutex_init (&rtpsession->priv->lock);
   g_cond_init (&rtpsession->priv->cond);
   rtpsession->priv->sysclock = gst_system_clock_obtain ();
@@ -842,12 +859,15 @@ gst_rtp_session_init (GstRtpSession * rtpsession)
   rtpsession->priv->ptmap = g_hash_table_new_full (NULL, NULL, NULL,
       (GDestroyNotify) gst_caps_unref);
 
+  rtpsession->recv_rtcp_segment_seqnum = GST_SEQNUM_INVALID;
+
   gst_segment_init (&rtpsession->recv_rtp_seg, GST_FORMAT_UNDEFINED);
   gst_segment_init (&rtpsession->send_rtp_seg, GST_FORMAT_UNDEFINED);
 
   rtpsession->priv->thread_stopped = TRUE;
 
-  rtpsession->priv->rtx_count = 0;
+  rtpsession->priv->recv_rtx_req_count = 0;
+  rtpsession->priv->sent_rtx_req_count = 0;
 
   rtpsession->priv->ntp_time_source = DEFAULT_NTP_TIME_SOURCE;
 }
@@ -1009,8 +1029,10 @@ gst_rtp_session_create_stats (GstRtpSession * rtpsession)
   GstStructure *s;
 
   g_object_get (rtpsession->priv->session, "stats", &s, NULL);
-  gst_structure_set (s, "rtx-count", G_TYPE_UINT, rtpsession->priv->rtx_count,
-      NULL);
+  gst_structure_set (s, "rtx-count", G_TYPE_UINT,
+      rtpsession->priv->recv_rtx_req_count, "recv-rtx-req-count", G_TYPE_UINT,
+      rtpsession->priv->recv_rtx_req_count, "sent-rtx-req-count", G_TYPE_UINT,
+      rtpsession->priv->sent_rtx_req_count, NULL);
 
   return s;
 }
@@ -1274,6 +1296,7 @@ gst_rtp_session_change_state (GstElement * element, GstStateChange transition)
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       /* downstream is now releasing the dataflow and we can join. */
       join_rtcp_thread (rtpsession);
+      rtp_session_reset (rtpsession->priv->session);
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
       break;
@@ -1301,8 +1324,7 @@ gst_rtp_session_clear_pt_map (GstRtpSession * rtpsession)
   g_hash_table_foreach_remove (rtpsession->priv->ptmap, return_true, NULL);
 }
 
-/* called when the session manager has an RTP packet or a list of packets
- * ready for further processing */
+/* called when the session manager has an RTP packet ready to be pushed */
 static GstFlowReturn
 gst_rtp_session_process_rtp (RTPSession * sess, RTPSource * src,
     GstBuffer * buffer, gpointer user_data)
@@ -1319,8 +1341,14 @@ gst_rtp_session_process_rtp (RTPSession * sess, RTPSource * src,
   GST_RTP_SESSION_UNLOCK (rtpsession);
 
   if (rtp_src) {
-    GST_LOG_OBJECT (rtpsession, "pushing received RTP packet");
-    result = gst_pad_push (rtp_src, buffer);
+    if (rtpsession->priv->processed_list) {
+      GST_LOG_OBJECT (rtpsession, "queueing received RTP packet");
+      gst_buffer_list_add (rtpsession->priv->processed_list, buffer);
+      result = GST_FLOW_OK;
+    } else {
+      GST_LOG_OBJECT (rtpsession, "pushing received RTP packet");
+      result = gst_pad_push (rtp_src, buffer);
+    }
     gst_object_unref (rtp_src);
   } else {
     GST_DEBUG_OBJECT (rtpsession, "dropping received RTP packet");
@@ -1400,6 +1428,8 @@ do_rtcp_events (GstRtpSession * rtpsession, GstPad * srcpad)
   GST_RTP_SESSION_UNLOCK (rtpsession);
 
   event = gst_event_new_stream_start (stream_id);
+  rtpsession->recv_rtcp_segment_seqnum = gst_event_get_seqnum (event);
+  gst_event_set_seqnum (event, rtpsession->recv_rtcp_segment_seqnum);
   if (have_group_id)
     gst_event_set_group_id (event, group_id);
   gst_pad_push_event (srcpad, event);
@@ -1411,6 +1441,7 @@ do_rtcp_events (GstRtpSession * rtpsession, GstPad * srcpad)
 
   gst_segment_init (&seg, GST_FORMAT_TIME);
   event = gst_event_new_segment (&seg);
+  gst_event_set_seqnum (event, rtpsession->recv_rtcp_segment_seqnum);
   gst_pad_push_event (srcpad, event);
 }
 
@@ -1419,7 +1450,7 @@ do_rtcp_events (GstRtpSession * rtpsession, GstPad * srcpad)
  * well. */
 static GstFlowReturn
 gst_rtp_session_send_rtcp (RTPSession * sess, RTPSource * src,
-    GstBuffer * buffer, gboolean eos, gpointer user_data)
+    GstBuffer * buffer, gboolean all_sources_bye, gpointer user_data)
 {
   GstFlowReturn result;
   GstRtpSession *rtpsession;
@@ -1442,10 +1473,18 @@ gst_rtp_session_send_rtcp (RTPSession * sess, RTPSource * src,
     GST_LOG_OBJECT (rtpsession, "sending RTCP");
     result = gst_pad_push (rtcp_src, buffer);
 
-    /* we have to send EOS after this packet */
-    if (eos) {
+    /* Forward send an EOS on the RTCP sink if we received an EOS on the
+     * send_rtp_sink. We don't need to check the recv_rtp_sink since in this
+     * case the EOS event would already have been sent */
+    if (all_sources_bye && rtpsession->send_rtp_sink &&
+        GST_PAD_IS_EOS (rtpsession->send_rtp_sink)) {
+      GstEvent *event;
+
       GST_LOG_OBJECT (rtpsession, "sending EOS");
-      gst_pad_push_event (rtcp_src, gst_event_new_eos ());
+
+      event = gst_event_new_eos ();
+      gst_event_set_seqnum (event, rtpsession->recv_rtcp_segment_seqnum);
+      gst_pad_push_event (rtcp_src, event);
     }
     gst_object_unref (rtcp_src);
   } else {
@@ -1669,6 +1708,7 @@ gst_rtp_session_event_recv_rtp_sink (GstPad * pad, GstObject * parent,
     }
     case GST_EVENT_FLUSH_STOP:
       gst_segment_init (&rtpsession->recv_rtp_seg, GST_FORMAT_UNDEFINED);
+      rtpsession->recv_rtcp_segment_seqnum = GST_SEQNUM_INVALID;
       ret = gst_pad_push_event (rtpsession->recv_rtp_src, event);
       break;
     case GST_EVENT_SEGMENT:
@@ -1703,11 +1743,15 @@ gst_rtp_session_event_recv_rtp_sink (GstPad * pad, GstObject * parent,
         gst_object_ref (rtcp_src);
       GST_RTP_SESSION_UNLOCK (rtpsession);
 
+      gst_event_unref (event);
+
       if (rtcp_src) {
+        event = gst_event_new_eos ();
+        if (rtpsession->recv_rtcp_segment_seqnum != GST_SEQNUM_INVALID)
+          gst_event_set_seqnum (event, rtpsession->recv_rtcp_segment_seqnum);
         ret = gst_pad_push_event (rtcp_src, event);
         gst_object_unref (rtcp_src);
       } else {
-        gst_event_unref (event);
         ret = TRUE;
       }
       break;
@@ -1782,15 +1826,12 @@ gst_rtp_session_event_recv_rtp_src (GstPad * pad, GstObject * parent,
                 all_headers, count))
           forward = FALSE;
       } else if (gst_structure_has_name (s, "GstRTPRetransmissionRequest")) {
-        GstClockTime running_time;
         guint seqnum, delay, deadline, max_delay, avg_rtt;
 
         GST_RTP_SESSION_LOCK (rtpsession);
-        rtpsession->priv->rtx_count++;
+        rtpsession->priv->recv_rtx_req_count++;
         GST_RTP_SESSION_UNLOCK (rtpsession);
 
-        if (!gst_structure_get_clock_time (s, "running-time", &running_time))
-          running_time = -1;
         if (!gst_structure_get_uint (s, "ssrc", &ssrc))
           ssrc = -1;
         if (!gst_structure_get_uint (s, "seqnum", &seqnum))
@@ -1944,6 +1985,60 @@ push_error:
 }
 
 static gboolean
+process_received_buffer_in_list (GstBuffer ** buffer, guint idx, gpointer data)
+{
+  gint ret;
+
+  ret = gst_rtp_session_chain_recv_rtp (NULL, data, *buffer);
+  if (ret != GST_FLOW_OK)
+    GST_ERROR ("Processing individual buffer in a list failed");
+
+  /*
+   * The buffer has been processed, remove it from the original list, if it was
+   * a valid RTP buffer it has been added to the "processed" list in
+   * gst_rtp_session_process_rtp().
+   */
+  *buffer = NULL;
+  return TRUE;
+}
+
+static GstFlowReturn
+gst_rtp_session_chain_recv_rtp_list (GstPad * pad, GstObject * parent,
+    GstBufferList * list)
+{
+  GstRtpSession *rtpsession = GST_RTP_SESSION (parent);
+  GstBufferList *processed_list;
+
+  processed_list = gst_buffer_list_new ();
+
+  /* Set some private data to detect that a buffer list is being pushed. */
+  rtpsession->priv->processed_list = processed_list;
+
+  /*
+   * Individually process the buffers from the incoming buffer list as the
+   * incoming RTP packets in the list can be mixed in all sorts of ways:
+   *    - different frames,
+   *    - different sources,
+   *    - different types (RTP or RTCP)
+   */
+  gst_buffer_list_foreach (list,
+      (GstBufferListFunc) process_received_buffer_in_list, parent);
+
+  gst_buffer_list_unref (list);
+
+  /* Clean up private data in case the next push does not use a buffer list. */
+  rtpsession->priv->processed_list = NULL;
+
+  if (gst_buffer_list_length (processed_list) == 0 || !rtpsession->recv_rtp_src) {
+    gst_buffer_list_unref (processed_list);
+    return GST_FLOW_OK;
+  }
+
+  GST_LOG_OBJECT (rtpsession, "pushing received RTP list");
+  return gst_pad_push_list (rtpsession->recv_rtp_src, processed_list);
+}
+
+static gboolean
 gst_rtp_session_event_recv_rtcp_sink (GstPad * pad, GstObject * parent,
     GstEvent * event)
 {
@@ -1986,6 +2081,7 @@ gst_rtp_session_chain_recv_rtcp (GstPad * pad, GstObject * parent,
   GstRtpSession *rtpsession;
   GstRtpSessionPrivate *priv;
   GstClockTime current_time;
+  GstClockTime running_time;
   guint64 ntpnstime;
 
   rtpsession = GST_RTP_SESSION (parent);
@@ -1998,9 +2094,10 @@ gst_rtp_session_chain_recv_rtcp (GstPad * pad, GstObject * parent,
   GST_RTP_SESSION_UNLOCK (rtpsession);
 
   current_time = gst_clock_get_time (priv->sysclock);
-  get_current_times (rtpsession, NULL, &ntpnstime);
+  get_current_times (rtpsession, &running_time, &ntpnstime);
 
-  rtp_session_process_rtcp (priv->session, buffer, current_time, ntpnstime);
+  rtp_session_process_rtcp (priv->session, buffer, current_time, running_time,
+      ntpnstime);
 
   return GST_FLOW_OK;           /* always return OK */
 }
@@ -2249,7 +2346,7 @@ gst_rtp_session_setcaps_send_rtp (GstPad * pad, GstRtpSession * rtpsession,
   return TRUE;
 }
 
-/* Recieve an RTP packet or a list of packets to be send to the receivers,
+/* Receive an RTP packet or a list of packets to be sent to the receivers,
  * send to RTP session manager and forward to send_rtp_src.
  */
 static GstFlowReturn
@@ -2269,8 +2366,8 @@ gst_rtp_session_chain_send_rtp_common (GstRtpSession * rtpsession,
   if (is_list) {
     GstBuffer *buffer = NULL;
 
-    /* All groups in an list have the same timestamp.
-     * So, just take it from the first group. */
+    /* All buffers in a list have the same timestamp.
+     * So, just take it from the first buffer. */
     buffer = gst_buffer_list_get (GST_BUFFER_LIST_CAST (data), 0);
     if (buffer)
       timestamp = GST_BUFFER_PTS (buffer);
@@ -2342,6 +2439,8 @@ create_recv_rtp_sink (GstRtpSession * rtpsession)
       "recv_rtp_sink");
   gst_pad_set_chain_function (rtpsession->recv_rtp_sink,
       gst_rtp_session_chain_recv_rtp);
+  gst_pad_set_chain_list_function (rtpsession->recv_rtp_sink,
+      gst_rtp_session_chain_recv_rtp_list);
   gst_pad_set_event_function (rtpsession->recv_rtp_sink,
       gst_rtp_session_event_recv_rtp_sink);
   gst_pad_set_iterate_internal_links_function (rtpsession->recv_rtp_sink,
@@ -2688,6 +2787,10 @@ gst_rtp_session_notify_nack (RTPSession * sess, guint16 seqnum,
               "seqnum", G_TYPE_UINT, (guint) seqnum,
               "ssrc", G_TYPE_UINT, (guint) ssrc, NULL));
       gst_pad_push_event (send_rtp_sink, event);
+
+      GST_RTP_SESSION_LOCK (rtpsession);
+      rtpsession->priv->sent_rtx_req_count++;
+      GST_RTP_SESSION_UNLOCK (rtpsession);
 
       if (blp == 0)
         break;
