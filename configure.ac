@@ -293,6 +293,18 @@ AC_SUBST(GLIB_PREFIX)
 AC_SUBST(GST_PREFIX)
 AC_SUBST(GSTPB_PREFIX)
 
+dnl check for rockchip RGA
+RGA_LIBS=
+RGA_HEADER=
+
+AC_CHECK_LIB([rga], [c_RkRgaInit], RGA_LIBS="-lrga")
+AC_CHECK_HEADERS([rga/RgaApi.h], RGA_HEADER="yes")
+
+if test "x$RGA_LIBS" != "x" && test "x$RGA_HEADER" = "xyes"; then
+  AC_SUBST(RGA_LIBS)
+  AC_DEFINE(HAVE_RGA, 1, [Have rockchip RGA])
+fi
+
 dnl GTK is optional and used in examples
 HAVE_GTK=no
 GTK_REQ=3.0.0
